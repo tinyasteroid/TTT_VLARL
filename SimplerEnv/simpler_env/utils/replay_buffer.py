@@ -222,6 +222,7 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         self.normalize_advantage = all_args.normalize_advantage
         self.model_path = all_args.reward_model_path
         self.ref_video = None
+        self.random_reward_rng = np.random.default_rng(all_args.seed)
         #init model
         self.Critic=GAC_model(tag='critic')
         if all_args.ttt==1:
@@ -236,17 +237,26 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         self.args = all_args
 
     def compute_returns_ppo(self):
-        #TODO1: compute the value from vlm according to the obs
-        #get the progress from vlac according to the obs and instruction
-        progress = self.get_progress_from_vlac(self.obs[:self.step+1], self.instruction)  #objs should be step+1， so slice is :step+2
-        for i in range(self.step+1):
-            self.progress[i] = progress[i]
-
         #let the value be 0， so we don't need to compute the value
         #self.value_preds[:self.step] = 1 - self.progress[:self.step]
-        #compute the reward by progress
-        for step in range(self.step-self.tt_steps, self.step):
-            self.rewards[step] = self.progress[step+1] - self.progress[step] #normalize to 0-1
+        #sample independent random rewards for the current TTT window
+        reward_classes = self.random_reward_rng.choice(
+            3,
+            size=(self.tt_steps, self.num_env, 1),
+            p=(0.3620, 0.0953, 0.5427),
+        )
+        integer_rewards = np.zeros(reward_classes.shape, dtype=np.int32)
+        positive_mask = reward_classes == 0
+        negative_mask = reward_classes == 1
+        integer_rewards[positive_mask] = self.random_reward_rng.integers(
+            1, 54, size=positive_mask.sum()
+        )
+        integer_rewards[negative_mask] = self.random_reward_rng.integers(
+            -33, 0, size=negative_mask.sum()
+        )
+        self.rewards[self.step-self.tt_steps:self.step] = (
+            integer_rewards.astype(np.float32) / 100.0
+        )
         #compute the returns and advantages
         gae = 0
         for step in reversed(range(self.step-self.tt_steps, self.step)):

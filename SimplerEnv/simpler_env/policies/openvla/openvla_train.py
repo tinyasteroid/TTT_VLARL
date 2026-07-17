@@ -27,15 +27,23 @@ class OpenVLAPolicy:
         self.tpdv = dict(device=torch.device("cuda:" + str(device_id)), dtype=torch.bfloat16)
         self.tpdv_vn = dict(device=torch.device("cuda:" + str(device_id)), dtype=torch.float32)
         self.action_scale = 1.0
+        local_files_only = Path(self.args.vla_path).expanduser().exists()
 
         # openvla: register
-        self.image_processor = PrismaticImageProcessor.from_pretrained(self.args.vla_path, trust_remote_code=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.args.vla_path, trust_remote_code=True, padding_side="left")
-        self.processor = PrismaticProcessor.from_pretrained(
+        self.image_processor = PrismaticImageProcessor.from_pretrained(
             self.args.vla_path,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.args.vla_path,
+            trust_remote_code=True,
+            padding_side="left",
+            local_files_only=local_files_only,
+        )
+        self.processor = PrismaticProcessor(
             image_processor=self.image_processor,
             tokenizer=self.tokenizer,
-            trust_remote_code=True
         )
         # self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
         self.vla = OpenVLAForActionPredictionWithValueHead.from_pretrained(
@@ -46,6 +54,7 @@ class OpenVLAPolicy:
             trust_remote_code=True,
             device_map="cuda:" + str(self.device_id),
             vh_mode="a0",
+            local_files_only=local_files_only,
         )
 
         # openvla: lora
@@ -241,6 +250,7 @@ class OpenVLAPolicy:
             trust_remote_code=True,
             device_map="cuda:" + str(self.device_id),
             vh_mode="a0",
+            local_files_only=Path(self.args.vla_path).expanduser().exists(),
         )
         self.vla = PeftModel.from_pretrained(self.vla, path, is_trainable=True)
         self.vla.print_trainable_parameters()

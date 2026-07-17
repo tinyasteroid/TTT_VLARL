@@ -2,11 +2,13 @@ import os
 import pprint
 import random
 import gc
+import json
 import signal
+import traceback
 from collections import defaultdict
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 import torch
 import numpy as np
 import tyro
@@ -25,7 +27,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import imageio
 
 from simpler_env.policies.openvla.openvla_train import OpenVLAPolicy, OpenVLAPPO
-from simpler_env.policies.nora.nora_train import NoraPolicy
 
 
 @dataclass
@@ -86,6 +87,8 @@ class Args:
     wandb: bool = True
     only_render: bool = False
     render_info: bool = False
+    output_dir: str = ""
+    """Optional directory for config, videos, and structured run results."""
 
     #ttt
     tt_steps: int = 8  # do ttt every tt_steps
@@ -94,6 +97,9 @@ class Args:
     normalize_advantage: bool = True  # whether normalize advantage when updating policy
     from_epoch: int = 0  # which epoch to start ttt
     reward_model_path: str = ""  # the path to the reward model for ttt
+    reward_mode: Literal["vlac", "random_dense"] = "random_dense"
+    reward_seed: int = 0
+    episode_max_retries: int = 0
 
     obj_set: str = "test"  # which object set to run
 
@@ -105,6 +111,17 @@ class Runner:
 
         # alg_name
         assert self.args.alg_name in ["ppo", "grpo"]
+        if self.args.tt_steps <= 0:
+            raise ValueError("tt_steps must be positive")
+        if self.args.ttt and self.args.episode_len % self.args.tt_steps != 0:
+            raise ValueError(
+                "episode_len must be divisible by tt_steps when TTT is enabled: "
+                f"episode_len={self.args.episode_len}, tt_steps={self.args.tt_steps}"
+            )
+        if self.args.episode_max_retries < 0:
+            raise ValueError("episode_max_retries must be non-negative")
+        if self.args.max_episodes <= 0:
+            raise ValueError("max_episodes must be positive")
 
         # set seed
         np.random.seed(self.args.seed)
@@ -119,30 +136,31 @@ class Runner:
             mode="online" if self.args.wandb else "offline",
         )
         self.save_dir = Path(wandb.run.dir)
-        self.glob_dir = Path(wandb.run.dir) / ".." / "glob"
+        if self.args.output_dir:
+            self.glob_dir = Path(self.args.output_dir).expanduser().resolve()
+        else:
+            self.glob_dir = Path(wandb.run.dir) / ".." / "glob"
         self.glob_dir.mkdir(parents=True, exist_ok=True)
 
-        yaml.dump(all_args.__dict__, open(self.glob_dir / "config.yaml", "w"))
-
         self.args.glob_dir =  str(self.glob_dir)
+        with open(self.glob_dir / "config.yaml", "w", encoding="utf-8") as file:
+            yaml.safe_dump(all_args.__dict__, file, sort_keys=True)
+        self.episode_results = []
 
         # policy
-        from simpler_env.policies.openvla.openvla_train import OpenVLAPolicy, OpenVLAPPO
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()          #to solve a transformer bug
         self.device_id = 1 if torch.cuda.device_count() > 1 else 0    # make sure data and policy on the same device
         self.device_id_other = 1 if torch.cuda.device_count() > 1 else 0
         self.device = torch.device("cuda:" + str(self.device_id))
+        self.policy = self._build_policy()
+        self.alg = OpenVLAPPO(all_args, self.policy)
         if self.args.vla_type == "openvla":
-            self.policy = OpenVLAPolicy(all_args, self.device_id_other)
-            self.alg = OpenVLAPPO(all_args, self.policy)
             unnorm_state = self.policy.vla.get_action_stats(self.args.vla_unnorm_key)
             self.env = SimlerWrapper(self.args, unnorm_state)
             
             
         elif self.args.vla_type == "nora":
-            self.policy = NoraPolicy(all_args, self.device_id_other)
-            self.alg = OpenVLAPPO(all_args, self.policy)
             unnorm_state = self.policy.vla.get_action_stats(self.args.vla_unnorm_key)
             self.env = NoraWrapper(self.args, unnorm_state, self.policy)
             
@@ -157,6 +175,38 @@ class Runner:
             )
         minibatch_count = self.buffer.get_minibatch_count()
         print(f"Buffer minibatch count: {minibatch_count}")
+
+    def _build_policy(self):
+        if self.args.vla_type == "openvla":
+            return OpenVLAPolicy(self.args, self.device_id_other)
+        if self.args.vla_type == "nora":
+            from simpler_env.policies.nora.nora_train import NoraPolicy
+
+            return NoraPolicy(self.args, self.device_id_other)
+        raise ValueError(f"Unknown vla_type: {self.args.vla_type}")
+
+    def _reload_policy(self):
+        """Restore the initial policy without holding two model copies."""
+        self.alg = None
+        self.policy = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.policy = self._build_policy()
+        self.alg = OpenVLAPPO(self.args, self.policy)
+
+    def _write_run_results(self):
+        payload = {
+            "config": {
+                key: value
+                for key, value in self.args.__dict__.items()
+                if key != "glob_dir"
+            },
+            "output_dir": str(self.glob_dir),
+            "episodes": self.episode_results,
+        }
+        result_path = self.glob_dir / "run_results.json"
+        with open(result_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
 
     @torch.no_grad()
     def _get_action(self, obs, deterministic=False):
@@ -359,16 +409,12 @@ class Runner:
             if episode < self.args.from_epoch:
                 continue
             print(f"Episode {episode}/{max_episodes}")
-            # for unexceptional bugs
+            attempt = 0
             while True:
                 try:
-                    # reload policy for ttt
-                    if self.args.vla_type == "openvla":
-                        self.policy = OpenVLAPolicy(self.args, self.device_id_other)
-                        self.alg.policy = self.policy
-                    elif self.args.vla_type == "nora":
-                        self.policy = NoraPolicy(self.args, self.device_id_other)
-                        self.alg.policy = self.policy
+                    # Episode 0 reuses the policy loaded by Runner.__init__.
+                    if episode > 0 or attempt > 0:
+                        self._reload_policy()
 
                     env_infos = defaultdict(lambda: [])
                     ep_time = time.time()
@@ -401,9 +447,15 @@ class Runner:
                         #if (i + 1) % self.args.episode_len == 0 and self.args.ttt == 0:   
                         #    infos = self.train()
                     break  # 成功时跳出 while
-                except Exception as e:
-                    print(f" {episode}th loop meet {e}, retrying...")
-                    continue
+                except Exception:
+                    traceback.print_exc()
+                    if attempt >= self.args.episode_max_retries:
+                        raise
+                    attempt += 1
+                    print(
+                        f"Episode {episode} failed; retry "
+                        f"{attempt}/{self.args.episode_max_retries}"
+                    )
             
             #save the video:
             #self.buffer.obs[:,0], self.buffer.instruction
@@ -415,6 +467,28 @@ class Runner:
 
             imageio.mimwrite(video_path, self.buffer.obs[:,0], fps=10)
             print(f"success rate: {success_all/max_episodes}")
+
+            reward_window = self.buffer.rewards[:self.buffer.step]
+            episode_result = {
+                "episode": episode,
+                "instruction": self.buffer.instruction[0],
+                "success": success,
+                "cumulative_success_rate": success_all / (episode + 1),
+                "steps": self.buffer.step,
+                "ttt_windows": self.buffer.step // self.args.tt_steps,
+                "reward": {
+                    "mode": self.args.reward_mode,
+                    "seed": self.args.reward_seed,
+                    "mean": float(reward_window.mean()),
+                    "min": float(reward_window.min()),
+                    "max": float(reward_window.max()),
+                    "nonzero_count": int(np.count_nonzero(reward_window)),
+                },
+                "elapsed_seconds": time.time() - ep_time,
+                "video_path": video_path,
+            }
+            self.episode_results.append(episode_result)
+            self._write_run_results()
         
             #if episode == 0:
             #    break

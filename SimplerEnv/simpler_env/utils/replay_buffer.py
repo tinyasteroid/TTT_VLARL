@@ -3,9 +3,6 @@ import numpy as np
 from transformers import AutoModel, AutoTokenizer
 import imageio
 import os
-from evo_vlac import GAC_model
-from evo_vlac.utils.video_tool import compress_video
-import os
 
 
 class SeparatedReplayBuffer(object):
@@ -220,43 +217,53 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         self.advantages = np.zeros((self.ep_len, self.num_env, 1), dtype=np.float32)
         self.tt_steps = all_args.tt_steps
         self.normalize_advantage = all_args.normalize_advantage
-        self.model_path = all_args.reward_model_path
         self.ref_video = None
-        self.random_reward_rng = np.random.default_rng(all_args.seed)
-        #init model
-        self.Critic=GAC_model(tag='critic')
-        if all_args.ttt==1:
-            self.Critic.init_model(model_path=self.model_path,model_type='internvl2',device_map=f'cuda:0')
-        else:
-            self.Critic.init_model(model_path=self.model_path,model_type='internvl2',device_map=f'cpu')
-        self.Critic.temperature=0.5
-        self.Critic.top_k=1
-        self.Critic.set_config()
-        self.Critic.set_system_prompt()
-
         self.args = all_args
+        self.reward_mode = getattr(all_args, "reward_mode", "vlac")
+        if self.reward_mode not in {"vlac", "random_dense"}:
+            raise ValueError(f"Unsupported reward_mode: {self.reward_mode}")
+
+        self.Critic = None
+        self.random_reward_rng = None
+        if self.reward_mode == "random_dense":
+            reward_seed = getattr(all_args, "reward_seed", all_args.seed)
+            self.random_reward_rng = np.random.default_rng(reward_seed)
+        else:
+            from evo_vlac import GAC_model
+
+            self.model_path = all_args.reward_model_path
+            self.Critic = GAC_model(tag="critic")
+            device_map = "cuda:0" if all_args.ttt == 1 else "cpu"
+            self.Critic.init_model(
+                model_path=self.model_path,
+                model_type="internvl2",
+                device_map=device_map,
+            )
+            self.Critic.temperature = 0.5
+            self.Critic.top_k = 1
+            self.Critic.set_config()
+            self.Critic.set_system_prompt()
 
     def compute_returns_ppo(self):
+        if not 0 < self.tt_steps <= self.step <= self.ep_len:
+            raise ValueError(
+                "Expected 0 < tt_steps <= step <= episode_len, got "
+                f"tt_steps={self.tt_steps}, step={self.step}, episode_len={self.ep_len}"
+            )
+
         #let the value be 0， so we don't need to compute the value
         #self.value_preds[:self.step] = 1 - self.progress[:self.step]
-        #sample independent random rewards for the current TTT window
-        reward_classes = self.random_reward_rng.choice(
-            3,
-            size=(self.tt_steps, self.num_env, 1),
-            p=(0.3620, 0.0953, 0.5427),
-        )
-        integer_rewards = np.zeros(reward_classes.shape, dtype=np.int32)
-        positive_mask = reward_classes == 0
-        negative_mask = reward_classes == 1
-        integer_rewards[positive_mask] = self.random_reward_rng.integers(
-            1, 54, size=positive_mask.sum()
-        )
-        integer_rewards[negative_mask] = self.random_reward_rng.integers(
-            -33, 0, size=negative_mask.sum()
-        )
-        self.rewards[self.step-self.tt_steps:self.step] = (
-            integer_rewards.astype(np.float32) / 100.0
-        )
+        if self.reward_mode == "random_dense":
+            self._sample_random_dense_rewards()
+        else:
+            progress = self.get_progress_from_vlac(
+                self.obs[:self.step + 1], self.instruction
+            )
+            for i in range(self.step + 1):
+                self.progress[i] = progress[i]
+            for step in range(self.step - self.tt_steps, self.step):
+                self.rewards[step] = self.progress[step + 1] - self.progress[step]
+
         #compute the returns and advantages
         gae = 0
         for step in reversed(range(self.step-self.tt_steps, self.step)):
@@ -278,7 +285,29 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         else:
             self.advantages[self.step-self.tt_steps:self.step] = advantages
 
+    def _sample_random_dense_rewards(self):
+        """Sample random dense rewards for the current TTT window."""
+        reward_classes = self.random_reward_rng.choice(
+            3,
+            size=(self.tt_steps, self.num_env, 1),
+            p=(0.3620, 0.0953, 0.5427),
+        )
+        integer_rewards = np.zeros(reward_classes.shape, dtype=np.int32)
+        positive_mask = reward_classes == 0
+        negative_mask = reward_classes == 1
+        integer_rewards[positive_mask] = self.random_reward_rng.integers(
+            1, 54, size=positive_mask.sum()
+        )
+        integer_rewards[negative_mask] = self.random_reward_rng.integers(
+            -33, 0, size=negative_mask.sum()
+        )
+        self.rewards[self.step-self.tt_steps:self.step] = (
+            integer_rewards.astype(np.float32) / 100.0
+        )
+
     def get_progress_from_vlac(self, obs_seq, instruction):
+        from evo_vlac.utils.video_tool import compress_video
+
         #save obs_seq as a mp4 video, obs_seq（narray） with shape [T, 1, H, W, 3]
         obs_seq = obs_seq[:,0]  # [T, H, W, 3]
         if self.args.ttt:
@@ -355,5 +384,3 @@ class SeparatedReplayBuffer_perplexity(SeparatedReplayBuffer):
         super().__init__(all_args, obs_dim, act_dim)
         self.tt_steps = all_args.tt_steps
         self.args = all_args
-
-    

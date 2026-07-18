@@ -4,6 +4,12 @@ from transformers import AutoModel, AutoTokenizer
 import imageio
 import os
 
+from simpler_env.utils.synthetic_rewards import (
+    EPISODES_PER_TASK,
+    STEPS_PER_EPISODE,
+    build_task_reward_schedule,
+)
+
 
 class SeparatedReplayBuffer(object):
     def __init__(self, all_args, obs_dim, act_dim):
@@ -211,6 +217,8 @@ class SeparatedReplayBuffer_vlm(SeparatedReplayBuffer):
 
 
 class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
+    """Legacy VLAC-backed buffer retained for non-ablation entry points."""
+
     def __init__(self, all_args, obs_dim, act_dim):
         super().__init__(all_args, obs_dim, act_dim)
         self.progress = np.zeros((self.ep_len + 1, self.num_env, 1), dtype=np.float32)
@@ -219,30 +227,134 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         self.normalize_advantage = all_args.normalize_advantage
         self.ref_video = None
         self.args = all_args
-        self.reward_mode = getattr(all_args, "reward_mode", "vlac")
-        if self.reward_mode not in {"vlac", "random_dense"}:
+
+        from evo_vlac import GAC_model
+
+        self.model_path = all_args.reward_model_path
+        self.Critic = GAC_model(tag="critic")
+        device_map = "cuda:0" if all_args.ttt == 1 else "cpu"
+        self.Critic.init_model(
+            model_path=self.model_path,
+            model_type="internvl2",
+            device_map=device_map,
+        )
+        self.Critic.temperature = 0.5
+        self.Critic.top_k = 1
+        self.Critic.set_config()
+        self.Critic.set_system_prompt()
+
+    def compute_returns_ppo(self):
+        progress = self.get_progress_from_vlac(
+            self.obs[:self.step + 1], self.instruction
+        )
+        for index, value in enumerate(progress):
+            self.progress[index] = value
+        for step in range(self.step - self.tt_steps, self.step):
+            self.rewards[step] = self.progress[step + 1] - self.progress[step]
+        self._compute_reward_advantages()
+
+    def _compute_reward_advantages(self):
+        gae = 0
+        for step in reversed(range(self.step - self.tt_steps, self.step)):
+            delta = self.rewards[step]
+            gae = delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
+            self.returns[step] = gae
+        advantages = self.returns[self.step - self.tt_steps:self.step]
+        if self.normalize_advantage:
+            mean_advantages = advantages.mean()
+            std_advantages = advantages.std()
+            advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
+        self.advantages[self.step - self.tt_steps:self.step] = advantages
+
+    def get_progress_from_vlac(self, obs_seq, instruction):
+        from evo_vlac.utils.video_tool import compress_video
+
+        obs_seq = obs_seq[:, 0]
+        filename = "temp_video_ttt.mp4" if self.args.ttt else "temp_video_no_ttt.mp4"
+        test_video_path = os.path.join(self.args.glob_dir, filename)
+        imageio.mimwrite(test_video_path, obs_seq, fps=10)
+        test_video_compressed = os.path.join(
+            os.path.dirname(test_video_path), "test.mp4"
+        )
+        _, output_fps = compress_video(
+            test_video_path,
+            test_video_compressed,
+            fps=100,
+        )
+        _, value_list, _, _ = self.Critic.web_trajectory_critic(
+            task_description=instruction,
+            main_video_path=test_video_compressed,
+            reference_video_path=None,
+            batch_num=5,
+            think=False,
+            skip=1,
+            rich=False,
+            reverse_eval=False,
+            output_path="results",
+            fps=float(output_fps),
+            frame_skip=False,
+            done_flag=False,
+            in_context_done=False,
+            done_threshold=0.9,
+            video_output=False,
+        )
+        return value_list
+
+
+class SeparatedReplayBuffer_synthetic(SeparatedReplayBuffer):
+    def __init__(self, all_args, obs_dim, act_dim):
+        super().__init__(all_args, obs_dim, act_dim)
+        self.progress = np.zeros((self.ep_len + 1, self.num_env, 1), dtype=np.float32)
+        self.advantages = np.zeros((self.ep_len, self.num_env, 1), dtype=np.float32)
+        self.tt_steps = all_args.tt_steps
+        self.normalize_advantage = all_args.normalize_advantage
+        self.ref_video = None
+        self.args = all_args
+        self.reward_mode = getattr(all_args, "reward_mode", "synthetic_uniform")
+        if self.reward_mode not in {"synthetic_matched", "synthetic_uniform"}:
             raise ValueError(f"Unsupported reward_mode: {self.reward_mode}")
-
-        self.Critic = None
-        self.random_reward_rng = None
-        if self.reward_mode == "random_dense":
-            reward_seed = getattr(all_args, "reward_seed", all_args.seed)
-            self.random_reward_rng = np.random.default_rng(reward_seed)
-        else:
-            from evo_vlac import GAC_model
-
-            self.model_path = all_args.reward_model_path
-            self.Critic = GAC_model(tag="critic")
-            device_map = "cuda:0" if all_args.ttt == 1 else "cpu"
-            self.Critic.init_model(
-                model_path=self.model_path,
-                model_type="internvl2",
-                device_map=device_map,
+        if self.ep_len != STEPS_PER_EPISODE:
+            raise ValueError(
+                "Synthetic reward experiments require episode_len=160, got "
+                f"{self.ep_len}"
             )
-            self.Critic.temperature = 0.5
-            self.Critic.top_k = 1
-            self.Critic.set_config()
-            self.Critic.set_system_prompt()
+        if self.num_env != 1:
+            raise ValueError(
+                "The fixed 48,000-step reward schedule requires num_envs=1, got "
+                f"{self.num_env}"
+            )
+        if all_args.max_episodes > EPISODES_PER_TASK:
+            raise ValueError(
+                "Synthetic reward experiments support at most 20 episodes per task, got "
+                f"{all_args.max_episodes}"
+            )
+
+        reward_seed = getattr(all_args, "reward_seed", all_args.seed)
+        reward_task_index = getattr(all_args, "reward_task_index", 0)
+        self.synthetic_rewards = build_task_reward_schedule(
+            self.reward_mode,
+            reward_seed,
+            reward_task_index,
+        )
+        self.synthetic_reward_cursor = 0
+
+    def start_episode(self, episode: int) -> None:
+        """Select the deterministic reward segment for an episode or retry."""
+        if not 0 <= episode < EPISODES_PER_TASK:
+            raise ValueError(f"episode must be in [0, {EPISODES_PER_TASK - 1}]")
+        self.synthetic_reward_cursor = episode * self.ep_len
+
+    def get_minibatch_count(self):
+        """Return minibatches in one TTT window, not the full episode buffer."""
+        batch_size = self.tt_steps * self.num_env
+        if self.buffer_minibatch < 0:
+            return 1
+        if batch_size % self.buffer_minibatch != 0:
+            raise ValueError(
+                "tt_steps * num_envs must be divisible by buffer_minibatch: "
+                f"{self.tt_steps} * {self.num_env} vs {self.buffer_minibatch}"
+            )
+        return batch_size // self.buffer_minibatch
 
     def compute_returns_ppo(self):
         if not 0 < self.tt_steps <= self.step <= self.ep_len:
@@ -253,16 +365,7 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
 
         #let the value be 0， so we don't need to compute the value
         #self.value_preds[:self.step] = 1 - self.progress[:self.step]
-        if self.reward_mode == "random_dense":
-            self._sample_random_dense_rewards()
-        else:
-            progress = self.get_progress_from_vlac(
-                self.obs[:self.step + 1], self.instruction
-            )
-            for i in range(self.step + 1):
-                self.progress[i] = progress[i]
-            for step in range(self.step - self.tt_steps, self.step):
-                self.rewards[step] = self.progress[step + 1] - self.progress[step]
+        self._assign_synthetic_rewards()
 
         #compute the returns and advantages
         gae = 0
@@ -285,64 +388,25 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         else:
             self.advantages[self.step-self.tt_steps:self.step] = advantages
 
-    def _sample_random_dense_rewards(self):
-        """Sample random dense rewards for the current TTT window."""
-        reward_classes = self.random_reward_rng.choice(
-            3,
-            size=(self.tt_steps, self.num_env, 1),
-            p=(0.3620, 0.0953, 0.5427),
+    def _assign_synthetic_rewards(self):
+        """Assign the next deterministic window from this task's schedule."""
+        window_size = self.tt_steps * self.num_env
+        stop = self.synthetic_reward_cursor + window_size
+        if stop > self.synthetic_rewards.size:
+            raise RuntimeError("Synthetic reward schedule exhausted")
+        reward_window = self.synthetic_rewards[self.synthetic_reward_cursor:stop]
+        self.rewards[self.step-self.tt_steps:self.step] = reward_window.reshape(
+            self.tt_steps,
+            self.num_env,
+            1,
         )
-        integer_rewards = np.zeros(reward_classes.shape, dtype=np.int32)
-        positive_mask = reward_classes == 0
-        negative_mask = reward_classes == 1
-        integer_rewards[positive_mask] = self.random_reward_rng.integers(
-            1, 54, size=positive_mask.sum()
-        )
-        integer_rewards[negative_mask] = self.random_reward_rng.integers(
-            -33, 0, size=negative_mask.sum()
-        )
-        self.rewards[self.step-self.tt_steps:self.step] = (
-            integer_rewards.astype(np.float32) / 100.0
-        )
+        self.synthetic_reward_cursor = stop
 
-    def get_progress_from_vlac(self, obs_seq, instruction):
-        from evo_vlac.utils.video_tool import compress_video
-
-        #save obs_seq as a mp4 video, obs_seq（narray） with shape [T, 1, H, W, 3]
-        obs_seq = obs_seq[:,0]  # [T, H, W, 3]
-        if self.args.ttt:
-            #test_video_path = "temp_video_ttt.mp4"
-            test_video_path =  os.path.join(self.args.glob_dir,"temp_video_ttt.mp4")
-        else:
-            #test_video_path = "temp_video_no_ttt.mp4"
-            test_video_path =  os.path.join(self.args.glob_dir,"temp_video_no_ttt.mp4")
-        imageio.mimwrite(test_video_path, obs_seq, fps=10)        #here set 8, which will cause problems. So setting 10.
-        test_video_compressed = os.path.join(os.path.dirname(test_video_path),"test.mp4")
-        _,output_fps=compress_video(test_video_path, test_video_compressed,fps=100)
-        reference_video_compressed = None
-        result_path,value_list,critic_list,done_list = self.Critic.web_trajectory_critic(
-            task_description=instruction,
-            main_video_path=test_video_compressed,
-            reference_video_path=reference_video_compressed,#if None means no reference video, only use task_description to indicate the task
-            batch_num=5,#batch number
-            think=False,# whether to CoT
-            skip=1,#pair-wise step
-            rich=False,#whether to output decimal value
-            reverse_eval=False,#whether to reverse the evaluation(for VROC evaluation)
-            output_path="results",
-            fps=float(output_fps),
-            frame_skip=False,#True,#whether to skip frames(if false, each frame while be evaluated, cost more time)
-            done_flag=False,#whether to out put done value
-            in_context_done=False,#whether use reference video to generate done value
-            done_threshold=0.9,#done threshold
-            video_output=False#whether to output video
-        )
-
-        return value_list  #return the last value as the progress
-    
     def feed_forward_generator(self):     #only generate the data from range(self.step-self.tt_steps, self.step)
-        episode_length, n_rollout_threads = self.rewards.shape[:2]
-        batch_size = episode_length * n_rollout_threads
+        start = self.step - self.tt_steps
+        stop = self.step
+        n_rollout_threads = self.rewards.shape[1]
+        batch_size = self.tt_steps * n_rollout_threads
 
         if self.buffer_minibatch < 0:
             num_mini_batch = 1
@@ -353,13 +417,15 @@ class SeparatedReplayBuffer_vlac(SeparatedReplayBuffer):
         rand = torch.randperm(batch_size).numpy()
         sampler = [rand[i * self.buffer_minibatch:(i + 1) * self.buffer_minibatch] for i in range(num_mini_batch)]
 
-        obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
-        actions = self.actions.reshape(-1, self.actions.shape[-1])
-        value_preds = self.value_preds[:-1].reshape(-1, 1)
-        returns = self.returns.reshape(-1, 1)
-        masks = self.masks[:-1].reshape(-1, 1)
-        action_logits = self.action_log_probs.reshape(-1, self.action_log_probs.shape[-1])
-        advantages = self.advantages.reshape(-1, 1)
+        obs = self.obs[start:stop].reshape(-1, *self.obs.shape[2:])
+        actions = self.actions[start:stop].reshape(-1, self.actions.shape[-1])
+        value_preds = self.value_preds[start:stop].reshape(-1, 1)
+        returns = self.returns[start:stop].reshape(-1, 1)
+        masks = self.masks[start:stop].reshape(-1, 1)
+        action_logits = self.action_log_probs[start:stop].reshape(
+            -1, self.action_log_probs.shape[-1]
+        )
+        advantages = self.advantages[start:stop].reshape(-1, 1)
 
         for indices in sampler:
             # obs size [T+1 N Dim]-->[T N Dim]-->[T*N,Dim]-->[index,Dim]

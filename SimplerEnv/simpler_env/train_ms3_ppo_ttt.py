@@ -20,7 +20,19 @@ from mani_skill.utils import visualization
 from mani_skill.utils.visualization.misc import images_to_video
 
 from simpler_env.env.simpler_wrapper import SimlerWrapper, NoraWrapper
-from simpler_env.utils.replay_buffer import SeparatedReplayBuffer_vlac, SeparatedReplayBuffer, SeparatedReplayBuffer_vlm 
+from simpler_env.utils.replay_buffer import (
+    SeparatedReplayBuffer,
+    SeparatedReplayBuffer_synthetic,
+    SeparatedReplayBuffer_vlm,
+)
+from simpler_env.utils.synthetic_rewards import (
+    EPISODES_PER_TASK,
+    REWARD_ABLATION_TASKS,
+    STEPS_PER_EPISODE,
+    reward_schedule_sha256,
+    summarize_rewards,
+    validate_task_selection,
+)
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)  # allow ctrl+c
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -31,9 +43,8 @@ from simpler_env.policies.openvla.openvla_train import OpenVLAPolicy, OpenVLAPPO
 
 @dataclass
 class Args:
-    env_id: Annotated[str, tyro.conf.arg(aliases=["-e"])] = "PutCarrotOnPlateInScene-v1"
-    """The environment ID of the task you want to simulate. Can be one of
-    PutCarrotOnPlateInScene-v1, PutSpoonOnTableClothInScene-v1, StackGreenCubeOnYellowCubeBakedTexInScene-v1, PutEggplantInBasketScene-v1"""
+    env_id: Annotated[str, tyro.conf.arg(aliases=["-e"])] = "PutOnPlateInScene25Position-v1"
+    """Environment ID from the fixed 15-task reward-ablation manifest."""
 
     """Number of environments to run. With more than 1 environment the environment will use the GPU backend 
     which runs faster enabling faster large-scale evaluations. Note that the overall behavior of the simulation
@@ -45,8 +56,8 @@ class Args:
     name: str = "PPO-test"
 
     # env
-    num_envs: int = 64
-    episode_len: int = 80
+    num_envs: int = 1
+    episode_len: int = 160
     use_same_init: bool = False
 
     steps_max: int = 2000000
@@ -65,6 +76,7 @@ class Args:
     vla_unnorm_key: str = "bridge_orig"
     vla_load_path: str = ""
     vla_lora_rank: int = 32
+    vla_gradient_checkpointing: bool = True
 
     vla_lr: float = 1e-4
     vla_vhlr: float = 3e-3
@@ -93,12 +105,12 @@ class Args:
     #ttt
     tt_steps: int = 8  # do ttt every tt_steps
     ttt: int = 1  # whether use test time training
-    max_episodes: int = 10  # episodes to run
+    max_episodes: int = 20  # independent trials for one task
     normalize_advantage: bool = True  # whether normalize advantage when updating policy
     from_epoch: int = 0  # which epoch to start ttt
-    reward_model_path: str = ""  # the path to the reward model for ttt
-    reward_mode: Literal["vlac", "random_dense"] = "random_dense"
+    reward_mode: Literal["synthetic_matched", "synthetic_uniform"] = "synthetic_uniform"
     reward_seed: int = 0
+    reward_task_index: int = 0
     episode_max_retries: int = 0
 
     obj_set: str = "test"  # which object set to run
@@ -122,6 +134,26 @@ class Runner:
             raise ValueError("episode_max_retries must be non-negative")
         if self.args.max_episodes <= 0:
             raise ValueError("max_episodes must be positive")
+        if self.args.episode_len != STEPS_PER_EPISODE:
+            raise ValueError(
+                "The reward ablation requires episode_len=160, got "
+                f"{self.args.episode_len}"
+            )
+        if self.args.max_episodes > EPISODES_PER_TASK:
+            raise ValueError(
+                "The reward ablation supports at most 20 episodes per task, got "
+                f"{self.args.max_episodes}"
+            )
+        if self.args.num_envs != 1:
+            raise ValueError(
+                "The fixed 48,000-step schedule requires num_envs=1, got "
+                f"{self.args.num_envs}"
+            )
+        validate_task_selection(
+            self.args.reward_task_index,
+            self.args.env_id,
+            self.args.obj_set,
+        )
 
         # set seed
         np.random.seed(self.args.seed)
@@ -168,7 +200,7 @@ class Runner:
         else:
             raise ValueError(f"Unknown vla_type: {self.args.vla_type}")
 
-        self.buffer = SeparatedReplayBuffer_vlac(
+        self.buffer = SeparatedReplayBuffer_synthetic(
                 self.args,
                 obs_dim=(480, 640, 3),
                 act_dim=7,     
@@ -424,6 +456,7 @@ class Runner:
                     print(f"initialization: {obs_img.sum()}")
                    
                     self.buffer.warmup(obs_img.cpu().numpy(), instruction)
+                    self.buffer.start_episode(episode)
 
                     for i in tqdm(range(self.args.episode_len), desc="rollout"):        
                         value, action, logprob = self.collect()           #generate action
@@ -469,8 +502,16 @@ class Runner:
             print(f"success rate: {success_all/max_episodes}")
 
             reward_window = self.buffer.rewards[:self.buffer.step]
+            experiment_task = REWARD_ABLATION_TASKS[self.args.reward_task_index]
             episode_result = {
                 "episode": episode,
+                "task": {
+                    "index": self.args.reward_task_index,
+                    "category": experiment_task.category,
+                    "paper_name": experiment_task.paper_name,
+                    "env_id": experiment_task.env_id,
+                    "obj_set": experiment_task.obj_set,
+                },
                 "instruction": self.buffer.instruction[0],
                 "success": success,
                 "cumulative_success_rate": success_all / (episode + 1),
@@ -479,10 +520,18 @@ class Runner:
                 "reward": {
                     "mode": self.args.reward_mode,
                     "seed": self.args.reward_seed,
-                    "mean": float(reward_window.mean()),
-                    "min": float(reward_window.min()),
-                    "max": float(reward_window.max()),
-                    "nonzero_count": int(np.count_nonzero(reward_window)),
+                    "task_index": self.args.reward_task_index,
+                    "task_schedule_sha256": reward_schedule_sha256(
+                        self.buffer.synthetic_rewards
+                    ),
+                    "task_schedule_start": (
+                        self.args.reward_task_index * EPISODES_PER_TASK * STEPS_PER_EPISODE
+                    ),
+                    "episode_schedule_start": (
+                        self.args.reward_task_index * EPISODES_PER_TASK * STEPS_PER_EPISODE
+                        + episode * STEPS_PER_EPISODE
+                    ),
+                    "statistics": summarize_rewards(reward_window),
                 },
                 "elapsed_seconds": time.time() - ep_time,
                 "video_path": video_path,

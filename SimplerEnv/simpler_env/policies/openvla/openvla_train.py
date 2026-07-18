@@ -80,6 +80,8 @@ class OpenVLAPolicy:
                 ds = json.load(open(path, "r"))
                 self.vla.base_model.norm_stats[self.args.vla_unnorm_key] = ds[self.args.vla_unnorm_key]
 
+        self._configure_gradient_checkpointing()
+
         # set value head trainable
         for name, param in self.vla.named_parameters():
             if "value_head" in name:
@@ -118,6 +120,16 @@ class OpenVLAPolicy:
         betas = (self.args.vla_optim_beta1, self.args.vla_optim_beta2)
         self.vh_optimizer = AdamW(self.params_vh, lr=self.args.vla_vhlr, betas=betas)
         self.vla_optimizer = AdamW(self.params_vla, lr=self.args.vla_lr, betas=betas)
+
+    def _configure_gradient_checkpointing(self) -> None:
+        """Enable activation recomputation for single-24GB-GPU TTT updates."""
+        if not getattr(self.args, "vla_gradient_checkpointing", True):
+            return
+        self.vla.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self.vla.enable_input_require_grads()
+        print("VLA gradient checkpointing: enabled (use_reentrant=False)")
 
     def _preprocess_obs(self, x: dict, action: torch.Tensor = None) -> BatchFeature:
         images = x["image"]
@@ -253,6 +265,7 @@ class OpenVLAPolicy:
             local_files_only=Path(self.args.vla_path).expanduser().exists(),
         )
         self.vla = PeftModel.from_pretrained(self.vla, path, is_trainable=True)
+        self._configure_gradient_checkpointing()
         self.vla.print_trainable_parameters()
 
         if self.args.vla_unnorm_key not in self.vla.base_model.norm_stats:

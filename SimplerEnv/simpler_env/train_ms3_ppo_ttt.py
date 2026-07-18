@@ -165,7 +165,7 @@ class Runner:
             config=all_args.__dict__,
             project="RLVLA",
             name=self.args.name,
-            mode="online" if self.args.wandb else "offline",
+            mode="online" if self.args.wandb else "disabled",
         )
         self.save_dir = Path(wandb.run.dir)
         if self.args.output_dir:

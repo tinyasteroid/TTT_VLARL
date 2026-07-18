@@ -75,8 +75,11 @@ def query_gpus() -> list[dict[str, object]]:
     return gpus
 
 
-def select_gpu(min_free_memory_mib: int) -> tuple[int, list[dict[str, object]]]:
-    """Select the currently freest GPU that satisfies the memory threshold."""
+def select_gpu(
+    min_free_memory_mib: int,
+    gpu_index: int | None = None,
+) -> tuple[int, list[dict[str, object]]]:
+    """Select an available GPU, optionally requiring one physical index."""
     snapshot = query_gpus()
     candidates = [
         gpu
@@ -85,6 +88,20 @@ def select_gpu(min_free_memory_mib: int) -> tuple[int, list[dict[str, object]]]:
         and gpu["utilization_percent"] <= 5
         and not gpu["compute_processes"]
     ]
+    if gpu_index is not None:
+        requested = [gpu for gpu in snapshot if gpu["index"] == gpu_index]
+        if not requested:
+            raise ValueError(
+                f"Requested physical GPU {gpu_index} was not found. Snapshot: {snapshot}"
+            )
+        if requested[0] not in candidates:
+            raise RuntimeError(
+                f"Requested physical GPU {gpu_index} does not currently satisfy "
+                "the availability policy: "
+                f"free_memory >= {min_free_memory_mib} MiB, utilization <= 5%, "
+                f"and no compute process. GPU: {requested[0]}"
+            )
+        return gpu_index, snapshot
     if not candidates:
         raise RuntimeError(
             "No GPU currently satisfies the availability policy: "
@@ -113,6 +130,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reward-seed", type=int, default=0)
     parser.add_argument("--min-free-memory-mib", type=int, default=23_000)
+    parser.add_argument(
+        "--gpu-index",
+        type=int,
+        help="Require one physical GPU index instead of selecting any eligible GPU.",
+    )
     return parser.parse_args()
 
 
@@ -122,7 +144,7 @@ def run_one(
     task_index: int,
 ) -> dict[str, object]:
     task = REWARD_ABLATION_TASKS[task_index]
-    selected_gpu, before = select_gpu(args.min_free_memory_mib)
+    selected_gpu, before = select_gpu(args.min_free_memory_mib, args.gpu_index)
     episodes = 1 if args.smoke else 20
     task_slug = f"{task_index:02d}_{task.category}_{task.paper_name.lower().replace(' ', '_')}"
     run_dir = Path(args.output_root).expanduser().resolve() / mode / task_slug
@@ -195,6 +217,7 @@ def run_one(
         "task_index": task_index,
         "task": task.__dict__,
         "episodes": episodes,
+        "requested_physical_gpu": args.gpu_index,
         "selected_physical_gpu": selected_gpu,
         "gpu_snapshot_before": before,
         "gpu_snapshot_after": after,

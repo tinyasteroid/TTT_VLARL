@@ -94,13 +94,6 @@ def select_gpu(
             raise ValueError(
                 f"Requested physical GPU {gpu_index} was not found. Snapshot: {snapshot}"
             )
-        if requested[0] not in candidates:
-            raise RuntimeError(
-                f"Requested physical GPU {gpu_index} does not currently satisfy "
-                "the availability policy: "
-                f"free_memory >= {min_free_memory_mib} MiB, utilization <= 5%, "
-                f"and no compute process. GPU: {requested[0]}"
-            )
         return gpu_index, snapshot
     if not candidates:
         raise RuntimeError(
@@ -133,9 +126,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-index",
         type=int,
-        help="Require one physical GPU index instead of selecting any eligible GPU.",
+        help="Use one manually selected physical GPU index.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip task runs whose saved results pass completeness checks.",
     )
     return parser.parse_args()
+
+
+def task_slug(task_index: int) -> str:
+    """Return the stable output-directory name for one manifest task."""
+    task = REWARD_ABLATION_TASKS[task_index]
+    return (
+        f"{task_index:02d}_{task.category}_"
+        f"{task.paper_name.lower().replace(' ', '_')}"
+    )
+
+
+def load_completed_record(
+    output_root: Path,
+    mode: str,
+    task_index: int,
+    expected_episodes: int,
+) -> dict[str, object] | None:
+    """Load one completed task record, or return None when it must be rerun."""
+    run_dir = output_root / mode / task_slug(task_index)
+    launcher_path = run_dir / "launcher_result.json"
+    results_path = run_dir / "run_results.json"
+    if not launcher_path.is_file() or not results_path.is_file():
+        return None
+
+    with launcher_path.open(encoding="utf-8") as file:
+        launcher = json.load(file)
+    with results_path.open(encoding="utf-8") as file:
+        results = json.load(file)
+
+    episodes = results.get("episodes")
+    if not isinstance(episodes, list):
+        return None
+    expected_indices = list(range(expected_episodes))
+    actual_indices = [episode.get("episode") for episode in episodes]
+    complete = (
+        launcher.get("exit_code") == 0
+        and launcher.get("mode") == mode
+        and launcher.get("task_index") == task_index
+        and launcher.get("episodes") == expected_episodes
+        and len(episodes) == expected_episodes
+        and actual_indices == expected_indices
+        and all(episode.get("steps") == 160 for episode in episodes)
+        and all(episode.get("ttt_windows") == 20 for episode in episodes)
+        and all(
+            episode.get("reward", {}).get("mode") == mode
+            and episode.get("reward", {}).get("task_index") == task_index
+            for episode in episodes
+        )
+    )
+    if not complete:
+        return None
+    return launcher
 
 
 def run_one(
@@ -146,15 +196,15 @@ def run_one(
     task = REWARD_ABLATION_TASKS[task_index]
     selected_gpu, before = select_gpu(args.min_free_memory_mib, args.gpu_index)
     episodes = 1 if args.smoke else 20
-    task_slug = f"{task_index:02d}_{task.category}_{task.paper_name.lower().replace(' ', '_')}"
-    run_dir = Path(args.output_root).expanduser().resolve() / mode / task_slug
+    slug = task_slug(task_index)
+    run_dir = Path(args.output_root).expanduser().resolve() / mode / slug
     run_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
         args.python,
         "simpler_env/train_ms3_ppo_ttt.py",
         "--name",
-        f"{mode}-{task_slug}-seed{args.seed}",
+        f"{mode}-{slug}-seed{args.seed}",
         "--env_id",
         task.env_id,
         "--obj_set",
@@ -238,6 +288,7 @@ def run_one(
 
 def main() -> None:
     args = parse_args()
+    output_root = Path(args.output_root).expanduser().resolve()
     modes = (
         ("synthetic_uniform", "synthetic_matched")
         if args.mode == "both"
@@ -248,12 +299,27 @@ def main() -> None:
         if args.smoke
         else tuple(range(len(REWARD_ABLATION_TASKS)))
     )
+    expected_episodes = 1 if args.smoke else 20
     records = []
     for mode in modes:
         for task_index in task_indices:
+            if args.resume:
+                completed_record = load_completed_record(
+                    output_root,
+                    mode,
+                    task_index,
+                    expected_episodes,
+                )
+                if completed_record is not None:
+                    print(
+                        "Resume: skipping completed task "
+                        f"{mode} index {task_index}",
+                        flush=True,
+                    )
+                    records.append(completed_record)
+                    continue
             records.append(run_one(args, mode, task_index))
 
-    output_root = Path(args.output_root).expanduser().resolve()
     with (output_root / "experiment_manifest.json").open("w", encoding="utf-8") as file:
         json.dump(records, file, ensure_ascii=False, indent=2)
 
